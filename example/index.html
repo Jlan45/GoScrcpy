@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GoScrcpy</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; font-family: -apple-system, sans-serif; color: #eee; display: flex; height: 100vh; }
+
+/* Sidebar */
+#sidebar { width: 260px; background: #16213e; border-right: 1px solid #0f3460; display: flex; flex-direction: column; flex-shrink: 0; }
+#sidebar h2 { padding: 16px; font-size: 16px; border-bottom: 1px solid #0f3460; }
+#device-list { flex: 1; overflow-y: auto; padding: 8px; }
+.device-item { padding: 10px 12px; border-radius: 6px; margin-bottom: 6px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; font-size: 13px; }
+.device-item:hover { background: #1a2744; }
+.device-item.connected { background: #0f3460; }
+.device-item.active { background: #e94560; }
+.device-serial { font-weight: 600; }
+.device-name { font-size: 11px; color: #aaa; margin-top: 2px; }
+.device-state { font-size: 11px; padding: 2px 6px; border-radius: 3px; }
+.device-state.online { background: #2d6a4f; color: #b7e4c7; }
+.device-state.offline { background: #6c3a3a; color: #e8a8a8; }
+.btn-sm { font-size: 11px; padding: 4px 10px; border: none; border-radius: 4px; cursor: pointer; }
+.btn-connect { background: #2d6a4f; color: #fff; }
+.btn-disconnect { background: #6c3a3a; color: #fff; }
+#btn-refresh { width: calc(100% - 16px); margin: 8px; padding: 8px; background: #0f3460; color: #eee; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; }
+#btn-refresh:hover { background: #1a3a6e; }
+
+/* Main area */
+#main { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; overflow: hidden; }
+#status { margin: 8px 0; font-size: 14px; color: #aaa; }
+#decoder-info { font-size: 12px; color: #666; margin-bottom: 2px; }
+#frame-stats { font-size: 12px; color: #888; margin-bottom: 6px; font-variant-numeric: tabular-nums; }
+#view-container { position: relative; background: #000; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 24px rgba(0,0,0,0.5); }
+canvas { display: block; cursor: crosshair; }
+#toolbar { display: flex; gap: 8px; margin-top: 10px; }
+#toolbar button { background: #16213e; color: #eee; border: 1px solid #0f3460; border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
+#toolbar button:hover { background: #0f3460; }
+#no-device { color: #666; font-size: 15px; }
+</style>
+</head>
+<body>
+<div id="sidebar">
+  <h2>Devices</h2>
+  <div id="device-list"></div>
+  <button id="btn-refresh">Refresh Devices</button>
+</div>
+<div id="main">
+  <div id="status"></div>
+  <div id="decoder-info"></div>
+  <div id="frame-stats"></div>
+  <div id="view-container"><div id="no-device">Select a device to connect</div></div>
+  <div id="toolbar">
+    <button id="btnBack">Back</button>
+    <button id="btnHome">Home</button>
+    <button id="btnSwitch">Recent</button>
+    <button id="btnPower">Power</button>
+  </div>
+</div>
+<script>
+const viewContainer = document.getElementById('view-container');
+const statusEl = document.getElementById('status');
+const decoderInfoEl = document.getElementById('decoder-info');
+const frameStatsEl = document.getElementById('frame-stats');
+const deviceListEl = document.getElementById('device-list');
+
+let ws = null;
+let deviceW = 0, deviceH = 0;
+let serverCodec = '';
+let activeDecoder = null;
+let activeSerial = null;
+let stats = { total: 0, config: 0, key: 0, delta: 0, dropped: 0, decoded: 0 };
+let lastStatsUpdate = 0;
+
+const WEBCODECS_MAP = {
+  h264: 'avc1.640028', h265: 'hev1.1.6.L120', av1: 'av01.0.08M.08',
+};
+
+function hex2(v) { return v.toString(16).padStart(2, '0').toUpperCase(); }
+
+function parseH264CodecFromConfig(data) {
+  for (let i = 0; i < data.length - 4; i++) {
+    if (data[i]===0 && data[i+1]===0 && (data[i+2]===1||(data[i+2]===0&&data[i+3]===1))) {
+      const off = data[i+2]===1 ? i+3 : i+4;
+      if (off >= data.length) continue;
+      if ((data[off]&0x1F)===7 && off+3<data.length)
+        return `avc1.${hex2(data[off+1])}${hex2(data[off+2])}${hex2(data[off+3])}`;
+    }
+  }
+  return null;
+}
+
+function parseH265CodecFromConfig(data) {
+  for (let i = 0; i < data.length - 5; i++) {
+    if (data[i]===0 && data[i+1]===0 && (data[i+2]===1||(data[i+2]===0&&data[i+3]===1))) {
+      const off = data[i+2]===1 ? i+3 : i+4;
+      if (off+1>=data.length) continue;
+      const nalType = (data[off]>>1)&0x3F;
+      if (nalType===33 && off+12<data.length) {
+        const pb = data[off+3], tier = (pb>>5)&1?'H':'L', prof = pb&0x1F;
+        return `hev1.${prof}.6.${tier}${data[off+12]}`;
+      }
+    }
+  }
+  return null;
+}
+
+function updateStats() {
+  const now = performance.now();
+  if (now - lastStatsUpdate < 200) return;
+  lastStatsUpdate = now;
+  const dec = activeDecoder?.dec;
+  const state = dec?.decoder?.state || 'N/A';
+  const q = dec?.decoder?.decodeQueueSize || 0;
+  frameStatsEl.textContent = `Frames: ${stats.total} | Key: ${stats.key} | Delta: ${stats.delta} | Config: ${stats.config} | Dropped: ${stats.dropped} | Decoded: ${stats.decoded} | Queue: ${q} | ${state}`;
+}
+
+// --- WebCodecs Decoder ---
+class WebCodecsDecoder {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d');
+    this.decoder = null;
+    this.configData = null;
+    this.frameCount = 0;
+    this.codecString = null;
+    this.configured = false;
+    this.gotFirstKeyFrame = false;
+  }
+  init(codec) {
+    this.codecString = WEBCODECS_MAP[codec] || WEBCODECS_MAP.h264;
+    this.decoder = new VideoDecoder({
+      output: (frame) => {
+        this.ctx.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
+        frame.close();
+        stats.decoded++;
+        updateStats();
+      },
+      error: (e) => console.error('WebCodecs error:', e),
+    });
+  }
+  configure(codecStr) {
+    if (this.configured && this.codecString === codecStr) return;
+    this.codecString = codecStr;
+    this.configured = true;
+    if (this.decoder.state === 'configured') this.decoder.reset();
+    this.decoder.configure({ codec: this.codecString, optimizeForLatency: true });
+    decoderInfoEl.textContent = `Decoder: WebCodecs (${this.codecString})`;
+  }
+  onPacket(flags, data) {
+    const isKey = !!(flags & 0x01), isCfg = !!(flags & 0x02);
+    stats.total++;
+    if (isCfg) {
+      stats.config++;
+      this.configData = data;
+      let parsed = serverCodec==='h264' ? parseH264CodecFromConfig(data) : serverCodec==='h265' ? parseH265CodecFromConfig(data) : null;
+      this.configure(parsed || this.codecString);
+      updateStats();
+      return;
+    }
+    if (!this.configured) this.configure(this.codecString);
+    if (isKey) { stats.key++; this.gotFirstKeyFrame = true; } else { stats.delta++; }
+    if (!this.gotFirstKeyFrame) { stats.dropped++; updateStats(); return; }
+    let fd = data;
+    if (this.configData && isKey) {
+      const m = new Uint8Array(this.configData.length + data.length);
+      m.set(this.configData); m.set(data, this.configData.length); fd = m;
+    }
+    try {
+      this.decoder.decode(new EncodedVideoChunk({ type: isKey?'key':'delta', timestamp: this.frameCount++*1000, data: fd }));
+    } catch(e) { stats.dropped++; console.warn('decode err:', e); }
+    updateStats();
+  }
+  destroy() { if (this.decoder) try { this.decoder.close(); } catch(e) {} }
+}
+
+// --- Device list ---
+async function refreshDevices() {
+  try {
+    const res = await fetch('/api/devices');
+    const devices = await res.json();
+    renderDeviceList(devices);
+  } catch(e) { console.error('refresh devices:', e); }
+}
+
+function renderDeviceList(devices) {
+  deviceListEl.innerHTML = '';
+  if (!devices || devices.length === 0) {
+    deviceListEl.innerHTML = '<div style="color:#666;padding:12px;font-size:13px">No devices found</div>';
+    return;
+  }
+  devices.forEach(d => {
+    const el = document.createElement('div');
+    el.className = 'device-item' + (d.connected ? ' connected' : '') + (d.serial === activeSerial ? ' active' : '');
+    const stateClass = d.state === 'device' ? 'online' : 'offline';
+    el.innerHTML = `
+      <div>
+        <div class="device-serial">${d.serial}</div>
+        <div class="device-name">${d.name || d.state}</div>
+      </div>
+      <div style="display:flex;gap:4px;align-items:center">
+        <span class="device-state ${stateClass}">${d.state}</span>
+        ${d.connected
+          ? `<button class="btn-sm btn-disconnect" data-serial="${d.serial}" data-action="disconnect">Disconnect</button>`
+          : d.state === 'device'
+            ? `<button class="btn-sm btn-connect" data-serial="${d.serial}" data-action="connect">Connect</button>`
+            : ''}
+      </div>`;
+    if (d.connected) {
+      el.addEventListener('click', (e) => {
+        if (e.target.tagName === 'BUTTON') return;
+        viewDevice(d.serial);
+      });
+    }
+    deviceListEl.appendChild(el);
+  });
+
+  deviceListEl.querySelectorAll('button[data-action]').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const serial = btn.dataset.serial;
+      const action = btn.dataset.action;
+      btn.disabled = true;
+      btn.textContent = '...';
+      if (action === 'connect') {
+        const res = await fetch(`/api/connect?serial=${encodeURIComponent(serial)}`, { method: 'POST' });
+        const j = await res.json();
+        if (j.error) { statusEl.textContent = 'Error: ' + j.error; }
+        else { viewDevice(serial); }
+      } else {
+        if (serial === activeSerial) disconnectView();
+        await fetch(`/api/disconnect?serial=${encodeURIComponent(serial)}`, { method: 'POST' });
+      }
+      refreshDevices();
+    });
+  });
+}
+
+// --- View a device ---
+function disconnectView() {
+  if (ws) { ws.close(); ws = null; }
+  if (activeDecoder) { activeDecoder.dec.destroy(); activeDecoder = null; }
+  activeSerial = null;
+  deviceW = deviceH = 0;
+  stats = { total:0, config:0, key:0, delta:0, dropped:0, decoded:0 };
+  statusEl.textContent = '';
+  decoderInfoEl.textContent = '';
+  frameStatsEl.textContent = '';
+  viewContainer.innerHTML = '<div id="no-device">Select a device to connect</div>';
+  refreshDevices();
+}
+
+function viewDevice(serial) {
+  if (activeSerial === serial && ws && ws.readyState === WebSocket.OPEN) return;
+  disconnectView();
+  activeSerial = serial;
+  statusEl.textContent = `Connecting to ${serial}...`;
+  refreshDevices();
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws?serial=${encodeURIComponent(serial)}`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => { statusEl.textContent = `Connected to ${serial}, waiting for stream...`; };
+  ws.onclose = () => {
+    if (activeSerial === serial) {
+      statusEl.textContent = `Disconnected from ${serial}`;
+      frameStatsEl.textContent = '';
+    }
+  };
+  ws.onerror = () => ws.close();
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === 'string') {
+      const j = JSON.parse(ev.data);
+      if (j.error) statusEl.textContent = 'Error: ' + j.error;
+      return;
+    }
+    const buf = new Uint8Array(ev.data);
+    if (buf[0] === 2) { // info
+      const info = JSON.parse(new TextDecoder().decode(buf.slice(1)));
+      deviceW = info.width; deviceH = info.height; serverCodec = info.codec;
+      statusEl.textContent = `${info.device || info.serial} (${deviceW}x${deviceH}) - ${info.codec}`;
+      initView();
+      return;
+    }
+    if (buf[0] === 0 && activeDecoder) {
+      activeDecoder.dec.onPacket(buf[1], buf.slice(10));
+    }
+  };
+}
+
+function initView() {
+  viewContainer.innerHTML = '';
+  const canvas = document.createElement('canvas');
+  canvas.style.display = 'block'; canvas.style.cursor = 'crosshair';
+  viewContainer.appendChild(canvas);
+  const dec = new WebCodecsDecoder(canvas);
+  dec.init(serverCodec);
+  activeDecoder = { dec, el: canvas };
+  resizeView();
+  bindInput(canvas);
+}
+
+function resizeView() {
+  if (!deviceW || !activeDecoder) return;
+  const maxH = window.innerHeight - 100;
+  const maxW = window.innerWidth - 300;
+  const scale = Math.min(maxW / deviceW, maxH / deviceH, 1);
+  const canvas = activeDecoder.el;
+  canvas.width = Math.floor(deviceW * scale);
+  canvas.height = Math.floor(deviceH * scale);
+}
+
+// --- Input ---
+function sendBin(bytes) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(new Uint8Array(bytes).buffer); }
+
+function canvasToDevice(e) {
+  const el = activeDecoder?.el; if (!el) return {x:0,y:0};
+  const r = el.getBoundingClientRect();
+  return { x: Math.round((e.clientX-r.left)/r.width*deviceW), y: Math.round((e.clientY-r.top)/r.height*deviceH) };
+}
+
+function sendTouch(action, e) {
+  const {x,y} = canvasToDevice(e);
+  const buf = new ArrayBuffer(14), dv = new DataView(buf);
+  dv.setUint8(0,0); dv.setUint8(1,action);
+  dv.setInt32(2,x); dv.setInt32(6,y);
+  dv.setUint16(10,deviceW); dv.setUint16(12,deviceH);
+  sendBin(new Uint8Array(buf));
+}
+
+let mouseDown = false;
+function bindInput(el) {
+  el.addEventListener('mousedown', e => { mouseDown=true; sendTouch(0,e); });
+  el.addEventListener('mousemove', e => { if(mouseDown) sendTouch(2,e); });
+  el.addEventListener('mouseup', e => { mouseDown=false; sendTouch(1,e); });
+  el.addEventListener('mouseleave', e => { if(mouseDown){mouseDown=false;sendTouch(1,e);} });
+  el.addEventListener('touchstart', e => { e.preventDefault(); sendTouch(0,e.touches[0]); }, {passive:false});
+  el.addEventListener('touchmove', e => { e.preventDefault(); sendTouch(2,e.touches[0]); }, {passive:false});
+  el.addEventListener('touchend', e => { e.preventDefault(); sendTouch(1,e.changedTouches[0]); }, {passive:false});
+  el.addEventListener('wheel', e => {
+    e.preventDefault();
+    const {x,y} = canvasToDevice(e);
+    const buf = new ArrayBuffer(17), dv = new DataView(buf);
+    dv.setUint8(0,2); dv.setInt32(1,x); dv.setInt32(5,y);
+    dv.setUint16(9,deviceW); dv.setUint16(11,deviceH);
+    dv.setInt16(13,Math.round(e.deltaX/120)); dv.setInt16(15,-Math.round(e.deltaY/120));
+    sendBin(new Uint8Array(buf));
+  }, {passive:false});
+}
+
+document.getElementById('btnBack').onclick = () => sendBin([3]);
+document.getElementById('btnHome').onclick = () => sendBin([4]);
+document.getElementById('btnSwitch').onclick = () => sendBin([5]);
+document.getElementById('btnPower').onclick = () => sendBin([6]);
+document.getElementById('btn-refresh').onclick = refreshDevices;
+window.addEventListener('resize', resizeView);
+
+// Init
+refreshDevices();
+</script>
+</body>
+</html>
